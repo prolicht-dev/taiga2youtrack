@@ -25,8 +25,8 @@ def load_json(file_path):
 data = load_json('taiga-dump.json')
 
 # Utility function for pagination
-def paginate(data, page, page_size):
-    start = (page - 1) * page_size
+def paginate(data, skip, page_size):
+    start = skip
     end = start + page_size
     return data[start:end]
 
@@ -34,15 +34,15 @@ def paginate(data, page, page_size):
 @app.route('/issues', methods=['GET'])
 @basic_auth.required
 def get_issues():
-    page = int(request.args.get('page', 1))
+    skip = int(request.args.get('skip', 1))
     page_size = int(request.args.get('page_size', 10))
     
     issues = data.get('issues', [])
     
-    paginated_issues = paginate(issues, page, page_size)
+    paginated_issues = paginate(issues, skip, page_size)
     
     return jsonify({
-        'page': page,
+        'skip': skip,
         'page_size': page_size,
         'total_items': len(issues),
         'total_pages': (len(issues) + page_size - 1) // page_size,
@@ -53,15 +53,15 @@ def get_issues():
 @app.route('/user-stories', methods=['GET'])
 @basic_auth.required
 def get_user_stories():
-    page = int(request.args.get('page', 1))
+    skip = int(request.args.get('skip', 1))
     page_size = int(request.args.get('page_size', 10))
     
     user_stories = data.get('user_stories', [])
     
-    paginated_user_stories = paginate(user_stories, page, page_size)
+    paginated_user_stories = paginate(user_stories, skip, page_size)
     
     return jsonify({
-        'page': page,
+        'skip': skip,
         'page_size': page_size,
         'total_items': len(user_stories),
         'total_pages': (len(user_stories) + page_size - 1) // page_size,
@@ -72,15 +72,15 @@ def get_user_stories():
 @app.route('/tasks', methods=['GET'])
 @basic_auth.required
 def get_tasks():
-    page = int(request.args.get('page', 1))
+    skip = int(request.args.get('skip', 1))
     page_size = int(request.args.get('page_size', 10))
     
     tasks = data.get('tasks', [])
     
-    paginated_tasks = paginate(tasks, page, page_size)
+    paginated_tasks = paginate(tasks, skip, page_size)
     
     return jsonify({
-        'page': page,
+        'skip': skip,
         'page_size': page_size,
         'total_items': len(tasks),
         'total_pages': (len(tasks) + page_size - 1) // page_size,
@@ -91,15 +91,15 @@ def get_tasks():
 @app.route('/epics', methods=['GET'])
 @basic_auth.required
 def get_epics():
-    page = int(request.args.get('page', 1))
+    skip = int(request.args.get('skip', 1))
     page_size = int(request.args.get('page_size', 10))
     
     epics = data.get('epics', [])
     
-    paginated_epics = paginate(epics, page, page_size)
+    paginated_epics = paginate(epics, skip, page_size)
     
     return jsonify({
-        'page': page,
+        'skip': skip,
         'page_size': page_size,
         'total_items': len(epics),
         'total_pages': (len(epics) + page_size - 1) // page_size,
@@ -109,10 +109,7 @@ def get_epics():
 # Endpoint for users
 @app.route('/users', methods=['GET'])
 @basic_auth.required
-def get_users():
-    page = int(request.args.get('page', 1))
-    page_size = int(request.args.get('page_size', 10))
-    
+def get_users():    
     memberships = data.get('memberships', [])
     
     return jsonify({

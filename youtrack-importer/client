@@ -33,7 +33,51 @@ const signatures = {
   "/9j/": "image/jpg"
 };
 
+const stateMap = {
+  'new': 'Open',
+  'ready': 'Open',
+  'erfasst': 'Open',
+  'refinement': 'Open',
+  'ready-for-test': 'Submitted',
+  'needs-info': 'Reopened',
+  'information-wird-benotigt': 'Reopened',
+  'outsourced': 'Fixed',
+  'rejected': 'Won\'t fix',
+  'archived': 'Won\'t fix',
+  'archiviert': 'Won\'t fix',
+  'postponed': 'Won\'t fix',
+  'in-progress': 'In Progress',
+  'promoted-to-userstory': 'Duplicate',
+  'ready-for-deploy': 'Verified',
+  'done': 'Fixed',
+  'closed': 'Fixed',
+
+
+  'New': 'Open',
+  'Ready': 'Open',
+  'Erfasst': 'Open',
+  'Refinement': 'Open',
+  'Ready for test': 'Submitted',
+  'Needs Info': 'Reopened',
+  'Information wird benötigt': 'Reopened',
+  'Outsourced': 'Fixed',
+  'Rejected': 'Won\'t fix',
+  'Archived': 'Won\'t fix',
+  'Archiviert': 'Won\'t fix',
+  'Postponed': 'Won\'t fix',
+  'In Progress': 'In Progress',
+  'In progress': 'In Progress',
+  'Promoted to Userstory': 'Duplicate',
+  'Ready to Deploy': 'Verified',
+  'Done': 'Fixed',
+  'Closed': 'Fixed'
+};
+
 const unknownUserEmail = 'unknown.taiga@prolicht.at';
+const projectUserGroup = {
+  id: 'taiga.users.oneit',
+  name: 'OneIT Taiga Users'
+};
 
 /**
  *
@@ -79,13 +123,6 @@ class TaigaClient {
     this.url = params.loadValue('url');
 
     /**
-     * The name of the SSL key if it is selected.
-     * If you don't want to specify this parameter, pass 'null'.
-     * @type {string}
-     */
-    this.sslKeyName = params.loadValue('sslKeyName');
-
-    /**
      * The authorization token or the password entered by the user.
      * @type {string}
      */
@@ -96,24 +133,58 @@ class TaigaClient {
      * For reference on the http module, see {@link https://www.jetbrains.com/help/youtrack/devportal/v1-http.html|http}.
      * @type {Connection}
      */
-    this.connection = new http.Connection(this.url, this.sslKeyName).addHeader('Authorization', this.token);
+    this.connection = new http.Connection(this.url, this.sslKeyName).addHeader('Authorization', 'Basic ' + base64Encode(this.token));
 
 
     // init some class variable
     this.taigaStats = {};
+    this.totalCount = 0;
+    this.currentCount = 0;
 
     this.ytProject = {
       id: 'taiga-import',
       name: 'Taiga Import Project',
-      key: 'TAIGA'
+      key: 'TG',
+      teamGroups: [projectUserGroup],
+      // see https://www.jetbrains.com/help/youtrack/server/default-custom-fields.html#default-fields-default-projects
+      fields: [
+        {
+          id: 'IssueTyp',
+          name: 'IssueTyp',
+          type: 'enum'
+        },
+        {
+          id: 'IssuePriority',
+          name: 'IssuePriority',
+          type: 'enum'
+        },
+        {
+          id: 'IssueSeverity',
+          name: 'IssueSeverity',
+          type: 'enum'
+        },
+        {
+          id: 'StoryPoints',
+          name: 'StoryPoints',
+          type: 'integer'
+        },
+        {
+          id: 'MigrationTimestamp',
+          name: 'MigrationTimestamp',
+          type: 'string'
+        },
+      ]
     };
+
+    this.ytImportTypCounter = 0; // 0 = issue, 1 = userstory, 2 = epic, 3 = task
     
-    this.ytIssueCounter = 1; // page number
-    this.ytEpicCounter = 1; // page number
-    this.ytUserStoryCounter = 1; // page number
-    this.ytTaskCounter = 1; // page number
+    this.ytIssueCounter = 0;
+    this.ytEpicCounter = 0;
+    this.ytUserStoryCounter = 0;
+    this.ytTaskCounter = 0;
 
     this.ytUsers = [];
+    this.ytUserData = {};
     this.ytAdmins = [];
     this.ytAttachments = {};
   }
@@ -126,8 +197,11 @@ class TaigaClient {
     var responseStats = this.connection.getSync('/status');
     this.taigaStats = JSON.parse(responseStats.response);
 
-    console.log(`retrieved taiga stats...`);
+    this.totalCount = this.taigaStats.total_issues + this.taigaStats.total_user_stories + this.taigaStats.total_epics + this.taigaStats.total_tasks;
+
+    console.log('retrieved taiga stats, importing ' + this.totalCount + ' items');
     console.log(this.taigaStats);
+
 
     var response = this.connection.getSync('/users');
     var taigaUsers = JSON.parse(response.response);
@@ -159,6 +233,14 @@ class TaigaClient {
         this.ytAdmins.push(ytUser);
       }
       this.ytUsers.push(ytUser);
+      this.ytUserData[ytUser.id] = {
+        id: ytUser.id,
+        name: ytUser.id,
+        email: ytUser.email,
+        fullName: ytUser.fullName,
+        type: 'user',
+        banned: false,
+      };
     }, this);
     
     // always add the 'unknown' user for fallback mapping
@@ -170,7 +252,14 @@ class TaigaClient {
         banned: false,
         deleted: false
       });
-
+    this.ytUserData['unknown.taiga'] = {
+        id: 'unknown.taiga',
+        name: 'unknown.taiga',
+        email: unknownUserEmail,
+        fullName: 'unknown.taiga',
+        type: 'user',
+        banned: false,
+      };
 
     console.log('found ' + this.ytUsers.length + ' users');
     console.log('found ' + this.ytAdmins.length + ' admins');
@@ -188,7 +277,7 @@ class TaigaClient {
    * @returns {string[]} A list of timestamp formats.
    */
   getTimestampFormats() {
-    return ['yyyy-MM-dd\'T\'HH:mm:ss\'Z\'', 'yyyy-MM-dd\'T\'HH:mm:ss.SSS\'Z\'', 'yyyy-MM-dd'];
+    return [ 'yyyy-MM-dd\'T\'HH:mm:ss+0000', 'yyyy-MM-dd\'T\'HH:mm:ss\'Z\'', 'yyyy-MM-dd\'T\'HH:mm:ss.SSS\'Z\'', 'yyyy-MM-dd'];
   }
 
   /**
@@ -316,7 +405,11 @@ class TaigaClient {
    * @returns {User[]} A list of users that belong to the specified project.
    */
   getUsers(group, skip, top) {
-    this.ytUsers.slice(skip, skip + top);
+    if (group.id === projectUserGroup.id) {
+      return this.ytUsers.slice(skip, skip + top);
+    } else {
+      return [];
+    }
   }
 
   /**
@@ -334,15 +427,31 @@ class TaigaClient {
   getIssueUpdates(projectInfo, after, updatedAfter, top) {
     var ytIssues = [];
 
-    if (this.taigaStats.total_issues >= ((this.ytIssueCounter-1)*top)) {
-      ytIssues = this.getTaigaIssues(projectInfo, after, updatedAfter, top);
-    } else if (this.taigaStats.total_tasks >= ((this.ytTaskCounter-1)*top)) {
-      ytIssues = this.getTaigaTasks(projectInfo, after, updatedAfter, top);
-    } else if (this.taigaStats.total_user_stories >= ((this.ytUserStoryCounter-1)*top)) {
-      ytIssues = this.getTaigaUserStories(projectInfo, after, updatedAfter, top);
-    } else if (this.taigaStats.total_epics >= ((this.ytEpicCounter-1)*top)) {
-      ytIssues = this.getTaigaEpics(projectInfo, after, updatedAfter, top);
+    ytIssues = this.getTaigaIssues(projectInfo, after, updatedAfter, top);
+    if (ytIssues.length < top && this.ytUserStoryCounter == 0) {
+      var spaceLeft = top - ytIssues.length;
+      var fillerIssues = this.getTaigaUserStories(projectInfo, after, updatedAfter, top);
+      ytIssues = ytIssues.concat(fillerIssues);
+      this.ytUserStoryCounter = spaceLeft;
     }
+    if (ytIssues.length < top && this.ytEpicCounter == 0) {
+      var spaceLeft = top - ytIssues.length;
+      var fillerIssues = this.getTaigaEpics(projectInfo, after, updatedAfter, top);
+      ytIssues = ytIssues.concat(fillerIssues);
+      this.ytEpicCounter = spaceLeft;
+    }
+    if (ytIssues.length < top && this.ytTaskCounter == 0) {
+      var spaceLeft = top - ytIssues.length;
+      var fillerIssues = this.getTaigaTasks(projectInfo, after, updatedAfter, top);
+      ytIssues = ytIssues.concat(fillerIssues);
+      this.ytTaskCounter = spaceLeft;
+    }
+
+    ytIssues.sort((a, b) => a.id - b.id);
+
+    console.log('IMPORTING NEW ISSUES...');
+    console.log(ytIssues);
+    console.log('IMPORTING NEW ISSUES END');
 
     return ytIssues;
   }
@@ -402,7 +511,7 @@ class TaigaClient {
       id: id,
       mimeType: this.detectMimeType(attachment.attached_file.data),
       updated: attachment.modified_date,
-      visibleToUsers: this.ytUsers
+      visibleToGroups: [projectUserGroup]
     };
   }
   
@@ -414,12 +523,22 @@ class TaigaClient {
         id: parentId + "-comment-" + index,
         type: 'comment',
         text: this.replaceMediaLinksWithFilename(comment.comment, historyItems),
-        visibleToUsers: this.ytUsers
+        visibleToGroups: [projectUserGroup]
       };
   
     }, this);
   }
   
+  getYtEditorFromTaigaHistory(history) {
+    for(var i=history.length-1;i>0;i--){
+      if (history[i].user && history[i].user.length > 0) {
+        return this.getYtUserByEmail(history[i].user[0]);
+      }
+    }
+
+    return null;
+  }
+
   getYtHistoryFromTaigaHistory(historyItems, parentId) {
     return []; //ignore history for now...
   }
@@ -428,8 +547,9 @@ class TaigaClient {
     return {
       id: tag,
       name: tag,
-      editableByUsers: this.ytUsers,
-      usableByUsers: this.ytUsers,
+      visibleToGroups: [projectUserGroup],
+      usableByGroups: [projectUserGroup],
+      editableByGroups: [projectUserGroup],
     };
   }
   
@@ -487,7 +607,7 @@ class TaigaClient {
 
     var response = this.connection.getSync('/issues', {
       'page_size': top.toString(), 
-      'page': this.ytIssueCounter.toString(), 
+      'skip': this.ytIssueCounter.toString(), 
       'after_id': after.id, 
       'after_key': after.key, 
       'updated_after': updatedAfter
@@ -495,7 +615,7 @@ class TaigaClient {
     var issues = JSON.parse(response.response);
     console.log('loaded ' + issues.data.length + ' issues for counter ' + this.ytIssueCounter + ' and page size ' + top);
 
-    this.ytIssueCounter++;
+    this.ytIssueCounter += issues.data.length;
 
 
     var ytIssues = [];
@@ -522,8 +642,12 @@ class TaigaClient {
     if (issue.tags) {
       tags = issue.tags.map((tag) => this.getYtTagFromTaigaTag(tag), this);
     }
+    let watchers =[];
+    if (issue.watchers) {
+      watchers = issue.watchers.filter(watcher => !!watcher).map((watcher, idx) => this.getYtUserByEmail(watcher), this);
+    }
 
-    return {
+    var ytRes = {
       id: issue.ref,
       key: "TG-" + issue.ref,
       fields: {
@@ -532,25 +656,60 @@ class TaigaClient {
         comments: comments,
         created: issue.created_date,
         description: this.replaceMediaLinksWithFilename(issue.description, issue.history),
-        links: [],
         project: this.ytProject,
-        references: [],
-        resolved: false,
+        resolved: issue.finished_date,
         summary: issue.subject,
         tags: tags,
         updated: issue.modified_date,
-        visibleToUsers: this.ytUsers,
+        updatedBy: this.getYtEditorFromTaigaHistory(issue.history),
+        visibleToGroups: [projectUserGroup],
+        watchers: watchers,
+        // Custom fields
         State: {
+          type: 'state',
+          name: stateMap[issue.status],
+          isResolved: !!issue.finished_date
+        },
+        TaigaState: {
           type: 'enum',
-          value: issue.status
+          name: issue.status,
         },
         Type: {
           type: 'enum',
-          value: 'Issue'
+          value: 'Bug'
         },
+        IssueTyp: {
+          type: 'enum',
+          value: issue.type
+        },
+        IssuePriority: {
+          type: 'enum',
+          value: issue.priority
+        },
+        IssueSeverity: {
+          type: 'enum',
+          value: issue.severity
+        },
+        MigrationTimestamp: {
+          type: 'string',
+          value: new Date().toISOString()
+        }
       },
       history: history
     };
+
+    if (issue.assigned_to) {
+      ytRes.fields['Assignee'] = {
+        type: 'user',
+        id: this.getYtUserByEmail(issue.assigned_to).id,
+        login: this.getYtUserByEmail(issue.assigned_to).id,
+        email: this.getYtUserByEmail(issue.assigned_to).email,
+        name: this.getYtUserByEmail(issue.assigned_to).name,
+        fullName: this.getYtUserByEmail(issue.assigned_to).fullName
+      };
+    }
+
+    return ytRes;
   }
 
   getTaigaEpics(projectInfo, after, updatedAfter, top) {
@@ -563,7 +722,7 @@ class TaigaClient {
 
     var response = this.connection.getSync('/epics', {
       'page_size': top.toString(), 
-      'page': this.ytEpicCounter.toString(), 
+      'skip': this.ytEpicCounter.toString(), 
       'after_id': after.id, 
       'after_key': after.key, 
       'updated_after': updatedAfter
@@ -571,7 +730,7 @@ class TaigaClient {
     var epics = JSON.parse(response.response);
     console.log('loaded ' + epics.data.length + ' epics for counter ' + this.ytEpicCounter + ' and page size ' + top);
 
-    this.ytEpicCounter++;
+    this.ytEpicCounter += epics.data.length;
 
 
     var ytIssues = [];
@@ -608,8 +767,12 @@ class TaigaClient {
         type: 'link'
       }), this);  
     }
+    let watchers =[];
+    if (epic.watchers) {
+      watchers = epic.watchers.filter(watcher => !!watcher).map((watcher, idx) => this.getYtUserByEmail(watcher), this);
+    }
   
-    return {
+    var ytRes = {
       id: epic.ref,
       key: "TG-" + epic.ref,
       fields: {
@@ -620,24 +783,47 @@ class TaigaClient {
         description: this.replaceMediaLinksWithFilename(epic.description, epic.history),
         links: userStoryLinks,
         project: this.ytProject,
-        references: [],
-        resolved: false,
+        resolved: epic.finish_date,
         summary: epic.subject,
         tags: tags,
         updated: epic.modified_date,
-        visibleToUsers: [],
-        workItems: [],
+        updatedBy: this.getYtEditorFromTaigaHistory(epic.history),
+        visibleToGroups: [projectUserGroup],
+        watchers: watchers,
+        // Custom fields
         State: {
+          type: 'state',
+          name: stateMap[epic.status],
+          isResolved: !!epic.finish_date
+        },
+        TaigaState: {
           type: 'enum',
-          value: epic.status
+          name: epic.status,
         },
         Type: {
           type: 'enum',
           value: 'Epic'
         },
+        MigrationTimestamp: {
+          type: 'string',
+          value: new Date().toISOString()
+        }
       },
       history: history
     };
+
+    if (epic.assigned_to) {
+      ytRes.fields['Assignee'] = {
+        type: 'user',
+        id: this.getYtUserByEmail(epic.assigned_to).id,
+        login: this.getYtUserByEmail(epic.assigned_to).id,
+        email: this.getYtUserByEmail(epic.assigned_to).email,
+        name: this.getYtUserByEmail(epic.assigned_to).name,
+        fullName: this.getYtUserByEmail(epic.assigned_to).fullName
+      };
+    }
+
+    return ytRes;
   }
 
   getTaigaUserStories(projectInfo, after, updatedAfter, top) {
@@ -650,7 +836,7 @@ class TaigaClient {
 
     var response = this.connection.getSync('/user-stories', {
       'page_size': top.toString(), 
-      'page': this.ytUserStoryCounter.toString(), 
+      'skip': this.ytUserStoryCounter.toString(), 
       'after_id': after.id, 
       'after_key': after.key, 
       'updated_after': updatedAfter
@@ -658,7 +844,7 @@ class TaigaClient {
     var userstories = JSON.parse(response.response);
     console.log('loaded ' + userstories.data.length + ' userstories for counter ' + this.ytUserStoryCounter + ' and page size ' + top);
 
-    this.ytUserStoryCounter++;
+    this.ytUserStoryCounter += userstories.data.length;
 
 
     var ytIssues = [];
@@ -685,8 +871,12 @@ class TaigaClient {
     if (userStory.tags) {
       tags = userStory.tags.map((tag) => this.getYtTagFromTaigaTag(tag), this);
     }
+    let watchers =[];
+    if (userStory.watchers) {
+      watchers = userStory.watchers.filter(watcher => !!watcher).map((watcher, idx) => this.getYtUserByEmail(watcher), this);
+    }
 
-    return {
+    var ytRes = {
       id: userStory.ref,
       key: "TG-" + userStory.ref,
       fields: {
@@ -694,26 +884,56 @@ class TaigaClient {
         author: this.getYtUserByEmail(userStory.owner),
         comments: comments,
         created: userStory.created_date,
-        description: replaceMediaLinksWithFilename(userStory.description, userStory.history),
-        links: [],
+        description: this.replaceMediaLinksWithFilename(userStory.description, userStory.history),
         project: this.ytProject,
-        references: [],
-        resolved: false,
+        resolved: userStory.finish_date,
         summary: userStory.subject,
         tags: tags,
         updated: userStory.modified_date,
-        visibleToUsers: this.ytUsers,
+        updatedBy: this.getYtEditorFromTaigaHistory(userStory.history),
+        visibleToGroups: [projectUserGroup],
+        watchers: watchers,
+        // Custom fields
         State: {
+          type: 'state',
+          name: stateMap[userStory.status],
+          isResolved: !!userStory.finish_date
+        },
+        TaigaState: {
           type: 'enum',
-          value: userStory.status
+          name: userStory.status,
         },
         Type: {
           type: 'enum',
           value: 'User Story'
         },
+        MigrationTimestamp: {
+          type: 'string',
+          value: new Date().toISOString()
+        }
       },
       history: history
     };
+
+    if (userStory.role_points.find(p => p.points !== '?')) {
+      ytRes.fields['StoryPoints'] = {
+        type: 'integer',
+        value: userStory.role_points.find(p => p.points !== '?').points
+      }
+    }
+
+    if (userStory.assigned_to) {
+      ytRes.fields['Assignee'] = {
+        type: 'user',
+        id: this.getYtUserByEmail(userStory.assigned_to).id,
+        login: this.getYtUserByEmail(userStory.assigned_to).id,
+        email: this.getYtUserByEmail(userStory.assigned_to).email,
+        name: this.getYtUserByEmail(userStory.assigned_to).name,
+        fullName: this.getYtUserByEmail(userStory.assigned_to).fullName
+      };
+    }
+
+    return ytRes;
   }
 
   getTaigaTasks(projectInfo, after, updatedAfter, top) {
@@ -726,7 +946,7 @@ class TaigaClient {
 
     var response = this.connection.getSync('/tasks', {
       'page_size': top.toString(), 
-      'page': this.ytTaskCounter.toString(), 
+      'skip': this.ytTaskCounter.toString(), 
       'after_id': after.id, 
       'after_key': after.key, 
       'updated_after': updatedAfter
@@ -734,7 +954,7 @@ class TaigaClient {
     var tasks = JSON.parse(response.response);
     console.log('loaded ' + tasks.data.length + ' tasks for counter ' + this.ytTaskCounter + ' and page size ' + top);
 
-    this.ytTaskCounter++;
+    this.ytTaskCounter += tasks.data.length;
 
 
     var ytIssues = [];
@@ -771,8 +991,12 @@ class TaigaClient {
           type: 'link'
       }];
     }
+    let watchers =[];
+    if (task.watchers) {
+      watchers = task.watchers.filter(watcher => !!watcher).map((watcher, idx) => this.getYtUserByEmail(watcher).email, this);
+    }
 
-    return {
+    var ytRes = {
       id: task.ref,
       key: "TG-" + task.ref,
       fields: {
@@ -783,23 +1007,47 @@ class TaigaClient {
         description: this.replaceMediaLinksWithFilename(task.description, task.history),
         links: taskLinks,
         project: this.ytProject,
-        references: [],
-        resolved: false,
+        resolved: task.finished_date,
         summary: task.subject,
         tags: tags,
         updated: task.modified_date,
-        visibleToUsers: this.ytUsers,
+        updatedBy: this.getYtEditorFromTaigaHistory(task.history),
+        visibleToGroups: [projectUserGroup],
+        watchers: watchers,
+        // Custom fields
         State: {
+          type: 'state',
+          name: stateMap[task.status],
+          isResolved: !!task.finished_date
+        },
+        TaigaState: {
           type: 'enum',
-          value: task.status
+          name: task.status,
         },
         Type: {
           type: 'enum',
           value: 'Task'
         },
+        MigrationTimestamp: {
+          type: 'string',
+          value: new Date().toISOString()
+        }
       },
       history: history
     };
+
+    if (task.assigned_to) {
+      ytRes.fields['Assignee'] = {
+        type: 'user',
+        id: this.getYtUserByEmail(task.assigned_to).id,
+        login: this.getYtUserByEmail(task.assigned_to).id,
+        email: this.getYtUserByEmail(task.assigned_to).email,
+        name: this.getYtUserByEmail(task.assigned_to).name,
+        fullName: this.getYtUserByEmail(task.assigned_to).fullName
+      };
+    }
+
+    return ytRes;
   }
 }
 
@@ -1257,6 +1505,26 @@ class TaigaClient {
 
 
 // HELPERS
+
+function base64Encode(input) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let output = '';
+  let i = 0;
+
+  while (i < input.length) {
+    const a = input.charCodeAt(i++);
+    const b = input.charCodeAt(i++);
+    const c = input.charCodeAt(i++);
+    const index1 = a >> 2;
+    const index2 = ((a & 3) << 4) | (b >> 4);
+    const index3 = isNaN(b) ? 64 : ((b & 15) << 2) | (c >> 6);
+    const index4 = isNaN(c) ? 64 : c & 63;
+
+    output += chars.charAt(index1) + chars.charAt(index2) + chars.charAt(index3) + chars.charAt(index4);
+  }
+
+  return output;
+}
 
 function replaceMarkdownLinksWithPlaceholder(markdownText, path, placeholder) {
   // Regular expression to match Markdown links with the specific path
