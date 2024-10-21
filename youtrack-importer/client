@@ -1,0 +1,1271 @@
+/**
+MIT License
+
+Copyright (c) 2024 Prolicht GmbH
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+*/
+
+/* eslint-disable no-unused-vars */
+const http = require('@jetbrains/youtrack-scripting-api/http');
+
+const signatures = {
+  JVBERi0: "application/pdf",
+  R0lGODdh: "image/gif",
+  R0lGODlh: "image/gif",
+  iVBORw0KGgo: "image/png",
+  "/9j/": "image/jpg"
+};
+
+const unknownUserEmail = 'unknown.taiga@prolicht.at';
+
+/**
+ *
+ * When importing data, YouTrack follows the procedure below:
+ *
+ * 1. Establishes connection between YouTrack and the import source (see constructor).
+ * 2. Calls the `prepareToImport` function. In this function, the client can perform any necessary initialization.
+ * 3. Via the `getProjects` function, requests projects from the import source.
+ * 4. Searches for users and groups mentioned in each project (project leaders, teams, subsystem owners) and
+ * creates respective users and groups in YouTrack and Hub.
+ * 5. When creating a group, retrieves its members via the `getUsers` function and creates each user in YouTrack and Hub.
+ * 6. For each project, creates custom field prototypes in case the retrieved project contains descriptions of project fields.
+ * 7. For each project, requests issues in chunks via the `getIssues` function.
+ * 8. For each chunk of issues:
+ *      * Checks that all required fields have values and correct types.
+ *      * Checks that each field uses the same representation (strings or objects) and has the same type in each issue.
+ *      * Searches for users and groups mentioned in each issue (authors, updaters, field values) and
+ *      creates respective users and groups in YouTrack and Hub.
+ *      * Retrieves members of each user group mentioned in each issue via `getUsers` function and creates each user in YouTrack and Hub.
+ *      * Defines types for fields that use string representation. If the field already exists in YouTrack, its type is preserved.
+ *      If the field does not exist in YouTrack yet, creates this field with the `string` type.
+ *      * Creates values to be assigned to YouTrack issue fields.
+ * 9. For each issue from the import source, creates a YouTrack issue and assigns values to its fields.
+ *
+ * For reference on the Connection class, see https://www.jetbrains.com/help/youtrack/devportal/v1-Connection.html
+ */
+
+/**
+ * A class implementing an API client interface.
+ */
+class TaigaClient {
+  /**
+   * Creating a TaigaClient instance.
+   * @param {Object} context The object holding parameters entered via the UI.
+   */
+  constructor(context) {
+    const params = context.parameters;
+
+    /**
+     * The URL of the import source entered by the user.
+     * @type {string}
+     */
+    this.url = params.loadValue('url');
+
+    /**
+     * The name of the SSL key if it is selected.
+     * If you don't want to specify this parameter, pass 'null'.
+     * @type {string}
+     */
+    this.sslKeyName = params.loadValue('sslKeyName');
+
+    /**
+     * The authorization token or the password entered by the user.
+     * @type {string}
+     */
+    this.token = params.loadValue('password');
+
+    /**
+     * The HTTP connection that can be used to retrieve data from the import source.
+     * For reference on the http module, see {@link https://www.jetbrains.com/help/youtrack/devportal/v1-http.html|http}.
+     * @type {Connection}
+     */
+    this.connection = new http.Connection(this.url, this.sslKeyName).addHeader('Authorization', this.token);
+
+
+    // init some class variable
+    this.taigaStats = {};
+
+    this.ytProject = {
+      id: 'taiga-import',
+      name: 'Taiga Import Project',
+      key: 'TAIGA'
+    };
+    
+    this.ytIssueCounter = 1; // page number
+    this.ytEpicCounter = 1; // page number
+    this.ytUserStoryCounter = 1; // page number
+    this.ytTaskCounter = 1; // page number
+
+    this.ytUsers = [];
+    this.ytAdmins = [];
+    this.ytAttachments = {};
+  }
+
+  /**
+   * A function that is invoked right before an import round is started.
+   * A client can perform any necessary initialization here.
+   */
+  prepareToImport() {
+    var responseStats = this.connection.getSync('/status');
+    this.taigaStats = JSON.parse(responseStats.response);
+
+    console.log(`retrieved taiga stats...`);
+    console.log(this.taigaStats);
+
+    var response = this.connection.getSync('/users');
+    var taigaUsers = JSON.parse(response.response);
+
+    console.log('taiga response contains ' + taigaUsers.data.length + ' member records');
+
+    taigaUsers.data.forEach((member) => {
+      if (!member.user && !member.email) {
+        return;
+      }
+
+      var email = member.email;
+      if (!email) {
+        email = member.user;
+      }
+
+      var username = email.replace('@prolicht.at','').replace('@prolicht.net','').replace('@prolicht.pt','').replace('@prolicht.es','').replace('@prolicht.fr','');
+
+      const ytUser = {
+        id: username,
+        name: username,
+        fullName: username,
+        email: email,
+        banned: false,
+        deleted: false
+      };
+  
+      if (member.isAdmin) {
+        this.ytAdmins.push(ytUser);
+      }
+      this.ytUsers.push(ytUser);
+    }, this);
+    
+    // always add the 'unknown' user for fallback mapping
+    this.ytUsers.push({
+        id: 'unknown.taiga',
+        name: 'unknown.taiga',
+        fullName: 'Unknown Taiga User',
+        email: unknownUserEmail,
+        banned: false,
+        deleted: false
+      });
+
+
+    console.log('found ' + this.ytUsers.length + ' users');
+    console.log('found ' + this.ytAdmins.length + ' admins');
+  }
+
+  /**
+   * Returns timestamp formats (for example, `yyyy-MM-dd'T'HH:mm:ss.SSSX`) that are used by the import source.
+   * The first of the returned values will be used to format the timestamp passed into the `updateAfter` parameter in
+   * the `getIssueUpdates` function.
+   * If the list is `null` or empty, the import will behave as if the `DEFAULT_TIME_FORMATS` object was returned.
+   * The string presentations matching against the formats containing timezone
+   * (for example, `yyyy-MM-dd'T'HH:mm:ss.SSSX` or `yyyy-MM-dd'T'HH:mm:ss.SSSZ`)
+   * will be converted to timestamps in the timezone parsed from that string.
+   * Otherwise, the timezone returned by the `getUserTimeZoneId` method is used.
+   * @returns {string[]} A list of timestamp formats.
+   */
+  getTimestampFormats() {
+    return ['yyyy-MM-dd\'T\'HH:mm:ss\'Z\'', 'yyyy-MM-dd\'T\'HH:mm:ss.SSS\'Z\'', 'yyyy-MM-dd'];
+  }
+
+  /**
+   * Returns the version and the time of the server.
+   * @returns {ServerInfo} An object with the version and time of the server set as its properties.
+   */
+  getServerInfo() {
+
+    /*
+          Here is an example of using the HTTP connection to the import source to retrieve the version:
+
+        ```
+        const result = this.connection.getSync('/version');
+        let fakeResponse;
+        if (result.isSuccess) {
+          return JSON.parse(result.response);
+        }
+        ```
+         */
+
+    return {
+      version: 'taiga',
+      time: new Date().toISOString()
+    };
+  }
+
+  /**
+     * Returns the content of the specified attachment.
+     *
+     * Alternatively, you can get the attachment content as an HTTP response.
+     * For this option, you will need to use the {@link https://www.jetbrains.com/help/youtrack/devportal/v1-http.html|http module}.
+     *
+     * See the example below and use it to replace the default method implementation.
+     *
+     * @example
+     *     const getAttachmentContent = (project, issue, attachment) => {
+     *         try {
+     *             return new http.Connection(attachment.contentUrl).getSync();
+     *         } catch (e) {
+     *             console.log(`Failed to download attachment ${attachment.contentUrl} ${attachment.fileName} :( `, e.message);
+     *         }
+     *     };
+     *
+     * @param {ProjectInfo} project The project where the attachment belongs to.
+     * @param {DocumentInfo} document The type of the entity where the attachment belongs to (issue or article).
+     * @param {Attachment} attachment The specified attachment.
+     * @returns {AttachmentContentWithMetadata} The content of the specified attachment.
+     */
+  getAttachmentContent(project, document, attachment) {
+    var data = this.ytAttachments[attachment.id];
+
+    delete this.ytAttachments[attachment.id];
+
+    return {
+      data: data,
+      metadata: {
+        mimeType: this.detectMimeType(data)
+      }
+    };
+  }
+
+  /**
+   * Returns all link types available in the import source.
+   * @returns {LinkType[]} A list of link types.
+   */
+  getLinkTypes() {
+    return [{
+      id: "subtask",
+      name: "Subtask",
+      sourceToTarget: 'parent for',
+      targetToSource: 'subtask of'
+    },
+    {
+      id: "workitem",
+      name: "Workitem",
+      sourceToTarget: 'Aufgabe von',
+      targetToSource: 'übergeordnet zu'
+    }
+  ];
+  }
+
+  /**
+   * Returns an object containing a detailed description of a project including its custom field schema. In case the
+   * method is not defined by a client, the custom field schema (types, values, cardinality) will be defined based on
+   * the values provided in the `Issue` objects.
+   * @param {ProjectInfo} projectInfo Information allowing the client to locate the project.
+   * @returns {Project} The detailed project description.
+   */
+  getProject(projectInfo) {
+    // we only have one project (one Taiga export contains one Taiga project)
+    return this.ytProject;
+  }
+
+  /**
+   * Returns information about all projects available in the import source.
+   * @returns {ProjectInfo[]} A list of projects available in the import source.
+   */
+  getProjects() {
+    return [this.ytProject];
+  }
+
+  /**
+   * This method is invoked during the initial issues loading phase to load issues in chunks.
+   * It's recommended that the issues are ordered by either internal ID or created date ascending. The returned
+   * issues will be imported one by one in the same order.
+   * Returns issues from the specified project.
+   * @param {ProjectInfo} projectInfo The project the returned issues belong to.
+   * @param {DocumentInfo=} after The issue that the returned issues follow.
+   * @param {number} top The number of issues to be returned. If there are fewer issues left to import, the method returns them all,
+   * if the method returns more issues than it was requested, those extra issues are not processed, and the next time the method is called,
+   * the last of the processed issues is passed into `after` parameter.
+   * @returns {Issue[]} A list of issues that follow the specified one in the specified project.
+   */
+  getIssues(projectInfo, after, top) {
+    // we only import issues using the getIssueUpdates function
+    return [];
+  }
+
+  /**
+   * Returns users belonging to the specified group.
+   * @param {UserGroup} group The user group to retrieve members of.
+   * @param {number} skip Number of heading records to skip.
+   * @param {number} top Maximum number of records to be returned. If more records are returned, only `top` number
+   * of these records will be processed and the rest will be ignored.
+   * @returns {User[]} A list of users that belong to the specified project.
+   */
+  getUsers(group, skip, top) {
+    this.ytUsers.slice(skip, skip + top);
+  }
+
+  /**
+   * The method is only required if the client supports continuous import mode.
+   * The issues should be ordered either by internal ID or created date ascending.
+   * Returns issues that were updated after the specified timestamp.
+   * @param {ProjectInfo} projectInfo The project where the requested issues belong.
+   * @param {DocumentInfo} [after] The issue that the requested issues follow.
+   * @param {string} updatedAfter The requested issues are expected to be updated after this timestamp.
+   * @param {number} top The number of issues to be returned. If there are fewer issues left to import, the method returns them all.
+   * If the method returns more issues than it was requested, those extra issues are not processed, and the next time the method is called,
+   * the last of the processed issues is passed into `after` parameter.
+   * @returns {Issue[]} Issues following the specified one in the specified project that were updated after the specified timestamp.
+   */
+  getIssueUpdates(projectInfo, after, updatedAfter, top) {
+    var ytIssues = [];
+
+    if (this.taigaStats.total_issues >= ((this.ytIssueCounter-1)*top)) {
+      ytIssues = this.getTaigaIssues(projectInfo, after, updatedAfter, top);
+    } else if (this.taigaStats.total_tasks >= ((this.ytTaskCounter-1)*top)) {
+      ytIssues = this.getTaigaTasks(projectInfo, after, updatedAfter, top);
+    } else if (this.taigaStats.total_user_stories >= ((this.ytUserStoryCounter-1)*top)) {
+      ytIssues = this.getTaigaUserStories(projectInfo, after, updatedAfter, top);
+    } else if (this.taigaStats.total_epics >= ((this.ytEpicCounter-1)*top)) {
+      ytIssues = this.getTaigaEpics(projectInfo, after, updatedAfter, top);
+    }
+
+    return ytIssues;
+  }
+
+  /**
+   * ID of the timezone of the user who runs the import.
+   * If `null` or empty, the import script will use the timezone of the YouTrack user.
+   * @returns {string} The ID of the user timezone.
+   */
+  getUserTimeZoneId() {
+    return 'Europe/Vienna';
+  }
+
+  /**
+   * Returns articles from the specified project.
+   * @param {ProjectInfo} projectInfo The project where the specified articles belong to.
+   * @param {DocumentInfo} [after] The article that the returned articles follow.
+   * @param {number} top The number of articles to be returned. If there are fewer articles left to import, the method returns them all.
+   * If the method returns more articles than it was requested, those extra articles are not processed, and the next time the method is called,
+   * the last of the processed articles is passed into `after` parameter.
+   * @return {Article[]} Articles following the specified one in the specified project.
+   */
+  getArticles(projectInfo, after, top) {
+    // wiki import is currently not implemented
+    return [];
+  }
+
+  /**
+   * The method is only required if the client supports continuous import mode.
+   * The articles should be ordered either by internal ID or created date ascending.
+   * Returns articles that were updated after the specified timestamp.
+   * @param {ProjectInfo} projectInfo The project where the requested articles belong.
+   * @param {DocumentInfo} [after] The article that the requested articles follow.
+   * @param {string} updatedAfter The requested articles are expected to be updated after this timestamp.
+   * @param {number} top The number of articles to be returned. If there are fewer articles left to import, the method returns them all.
+   * If the method returns more articles than it was requested, those extra articles are not processed, and the next time the method is called,
+   * the last of the processed articles is passed into `after` parameter.
+   * @returns {Article[]} Articles following the specified one in the specified project that were updated after the specified timestamp.
+   */
+  getArticleUpdates(projectInfo, after, updatedAfter, top) {
+    // wiki import is currently not implemented
+    return [];
+  }
+
+  ///////////////////////////////////////////////////
+  // CUSTOM FUNCTIONS
+  ///////////////////////////////////////////////////
+
+  getYtAttachmentFromTaigaAttachment(attachment, idx, id) {
+    // cache the attachment data, it will be used in the getAttachmentContent function
+    this.ytAttachments[id] = attachment.attached_file.data;
+
+    return {
+      author: this.getYtUserByEmail(attachment.owner),
+      created: attachment.created_at,
+      filename: idx + "_" + attachment.attached_file.name,
+      id: id,
+      mimeType: this.detectMimeType(attachment.attached_file.data),
+      updated: attachment.modified_date,
+      visibleToUsers: this.ytUsers
+    };
+  }
+  
+  getYtCommentsFromTaigaHistory(historyItems, parentId) {
+    return historyItems.filter(item => !!item.comment).map((comment, index) => {
+      return {
+        author: this.getYtUserByEmail(comment.user[0]),
+        created: comment.created_at,
+        id: parentId + "-comment-" + index,
+        type: 'comment',
+        text: this.replaceMediaLinksWithFilename(comment.comment, historyItems),
+        visibleToUsers: this.ytUsers
+      };
+  
+    }, this);
+  }
+  
+  getYtHistoryFromTaigaHistory(historyItems, parentId) {
+    return []; //ignore history for now...
+  }
+  
+  getYtTagFromTaigaTag(tag) {
+    return {
+      id: tag,
+      name: tag,
+      editableByUsers: this.ytUsers,
+      usableByUsers: this.ytUsers,
+    };
+  }
+  
+  
+  getYtUserByEmail(email) {
+    var user = this.ytUsers.find(u => u.email === email);
+    if (!user) {
+      // fallback mapping
+      user = this.ytUsers.find(u => u.email === unknownUserEmail);
+    }
+    return user;
+  }
+  
+  replaceMediaLinksWithFilename(text, history) {
+    if (!history || history.length === 0) {
+      return text;
+    }
+
+    // find last attachment change in history
+    var attOrder = [];
+    for(var i=history.length-1;i>0;i--){
+      if (history[i].diff.attachments) {
+        attOrder = history[i].diff.attachments[1];
+        console.log('found ' + attOrder.length + ' attachments in history, remapping...');
+        break;
+      }
+    }
+
+    // replace all links in the text with placeholders correlating with the order number
+    var newText = text;
+    attOrder.map((att, idx) => {
+      console.log('replacing ' + att.attached_file + ' with attachment id ' + idx + '_' + att.filename);
+      newText = replaceMarkdownLinksWithPlaceholder(newText, att.attached_file, "[](" + idx + "_" + att.filename + ")");
+    });
+
+    return newText;
+  }
+  
+  detectMimeType(b64) {
+    for (var s in signatures) {
+      if (b64.indexOf(s) === 0) {
+        return signatures[s];
+      }
+    }
+    return 'application/octed-stream';
+  }
+
+  getTaigaIssues(projectInfo, after, updatedAfter, top) {
+    if (after === null) {
+      after = {
+        'id': "null",
+        'key': "null"
+      }
+    }
+
+    var response = this.connection.getSync('/issues', {
+      'page_size': top.toString(), 
+      'page': this.ytIssueCounter.toString(), 
+      'after_id': after.id, 
+      'after_key': after.key, 
+      'updated_after': updatedAfter
+    });
+    var issues = JSON.parse(response.response);
+    console.log('loaded ' + issues.data.length + ' issues for counter ' + this.ytIssueCounter + ' and page size ' + top);
+
+    this.ytIssueCounter++;
+
+
+    var ytIssues = [];
+    issues.data.forEach((issue) => {
+      var ytIssue = this.convertTaigaIssue(issue);
+      ytIssues.push(ytIssue);
+    }, this);
+
+    return ytIssues;
+  }
+  
+  convertTaigaIssue(issue) {
+    let attachments =[];
+    if (issue.attachments) {
+      attachments = issue.attachments.map((attach, idx) => this.getYtAttachmentFromTaigaAttachment(attach, idx, 'i.' + issue.ref + ".att." + idx), this);
+    }
+    let comments = [];
+    let history = [];
+    if (issue.history) {
+      comments = this.getYtCommentsFromTaigaHistory(issue.history, issue.ref);
+      history = this.getYtHistoryFromTaigaHistory(issue.history, issue.ref);
+    }
+    let tags = [];
+    if (issue.tags) {
+      tags = issue.tags.map((tag) => this.getYtTagFromTaigaTag(tag), this);
+    }
+
+    return {
+      id: issue.ref,
+      key: "TG-" + issue.ref,
+      fields: {
+        attachments: attachments,
+        author: this.getYtUserByEmail(issue.owner),
+        comments: comments,
+        created: issue.created_date,
+        description: this.replaceMediaLinksWithFilename(issue.description, issue.history),
+        links: [],
+        project: this.ytProject,
+        references: [],
+        resolved: false,
+        summary: issue.subject,
+        tags: tags,
+        updated: issue.modified_date,
+        visibleToUsers: this.ytUsers,
+        State: {
+          type: 'enum',
+          value: issue.status
+        },
+        Type: {
+          type: 'enum',
+          value: 'Issue'
+        },
+      },
+      history: history
+    };
+  }
+
+  getTaigaEpics(projectInfo, after, updatedAfter, top) {
+    if (after === null) {
+      after = {
+        'id': "null",
+        'key': "null"
+      }
+    }
+
+    var response = this.connection.getSync('/epics', {
+      'page_size': top.toString(), 
+      'page': this.ytEpicCounter.toString(), 
+      'after_id': after.id, 
+      'after_key': after.key, 
+      'updated_after': updatedAfter
+    });
+    var epics = JSON.parse(response.response);
+    console.log('loaded ' + epics.data.length + ' epics for counter ' + this.ytEpicCounter + ' and page size ' + top);
+
+    this.ytEpicCounter++;
+
+
+    var ytIssues = [];
+    epics.data.forEach((epic) => {
+      var ytIssue = this.convertTaigaEpic(epic);
+      ytIssues.push(ytIssue);
+    }, this);
+
+    return ytIssues;
+  }
+
+  convertTaigaEpic(epic) {
+    let attachments =[];
+    if (epic.attachments) {
+      attachments = epic.attachments.map((attach, idx) => this.getYtAttachmentFromTaigaAttachment(attach, idx, 'e.' + epic.ref + ".att." + idx), this);
+    }
+    let comments = [];
+    let history = [];
+    if (epic.history) {
+      comments = this.getYtCommentsFromTaigaHistory(epic.history, epic.ref);
+      history = this.getYtHistoryFromTaigaHistory(epic.history, epic.ref);
+    }
+    let tags = [];
+    if (epic.tags) {
+      tags = epic.tags.map((tag) => this.getYtTagFromTaigaTag(tag), this);
+    }
+    let userStoryLinks = [];
+    if (epic.related_user_stories) {
+      userStoryLinks = epic.related_user_stories.map(rus => ({
+        linkName: 'subtask',
+        target: {
+          id: rus.user_story + ''
+        },
+        type: 'link'
+      }), this);  
+    }
+  
+    return {
+      id: epic.ref,
+      key: "TG-" + epic.ref,
+      fields: {
+        attachments: attachments,
+        author: this.getYtUserByEmail(epic.owner),
+        comments: comments,
+        created: epic.created_date,
+        description: this.replaceMediaLinksWithFilename(epic.description, epic.history),
+        links: userStoryLinks,
+        project: this.ytProject,
+        references: [],
+        resolved: false,
+        summary: epic.subject,
+        tags: tags,
+        updated: epic.modified_date,
+        visibleToUsers: [],
+        workItems: [],
+        State: {
+          type: 'enum',
+          value: epic.status
+        },
+        Type: {
+          type: 'enum',
+          value: 'Epic'
+        },
+      },
+      history: history
+    };
+  }
+
+  getTaigaUserStories(projectInfo, after, updatedAfter, top) {
+    if (after === null) {
+      after = {
+        'id': "null",
+        'key': "null"
+      }
+    }
+
+    var response = this.connection.getSync('/user-stories', {
+      'page_size': top.toString(), 
+      'page': this.ytUserStoryCounter.toString(), 
+      'after_id': after.id, 
+      'after_key': after.key, 
+      'updated_after': updatedAfter
+    });
+    var userstories = JSON.parse(response.response);
+    console.log('loaded ' + userstories.data.length + ' userstories for counter ' + this.ytUserStoryCounter + ' and page size ' + top);
+
+    this.ytUserStoryCounter++;
+
+
+    var ytIssues = [];
+    userstories.data.forEach((userstory) => {
+      var ytIssue = this.convertTaigaUserStory(userstory);
+      ytIssues.push(ytIssue);
+    }, this);
+
+    return ytIssues;
+  }
+
+  convertTaigaUserStory(userStory) {
+    let attachments =[];
+    if (userStory.attachments) {
+      attachments = userStory.attachments.map((attach, idx) => this.getYtAttachmentFromTaigaAttachment(attach, idx, 'u.' + userStory.ref + ".att." + idx), this);
+    }
+    let comments = [];
+    let history = [];
+    if (userStory.history) {
+      comments = this.getYtCommentsFromTaigaHistory(userStory.history, userStory.ref);
+      history = this.getYtHistoryFromTaigaHistory(userStory.history, userStory.ref);
+    }
+    let tags = [];
+    if (userStory.tags) {
+      tags = userStory.tags.map((tag) => this.getYtTagFromTaigaTag(tag), this);
+    }
+
+    return {
+      id: userStory.ref,
+      key: "TG-" + userStory.ref,
+      fields: {
+        attachments: attachments,
+        author: this.getYtUserByEmail(userStory.owner),
+        comments: comments,
+        created: userStory.created_date,
+        description: replaceMediaLinksWithFilename(userStory.description, userStory.history),
+        links: [],
+        project: this.ytProject,
+        references: [],
+        resolved: false,
+        summary: userStory.subject,
+        tags: tags,
+        updated: userStory.modified_date,
+        visibleToUsers: this.ytUsers,
+        State: {
+          type: 'enum',
+          value: userStory.status
+        },
+        Type: {
+          type: 'enum',
+          value: 'User Story'
+        },
+      },
+      history: history
+    };
+  }
+
+  getTaigaTasks(projectInfo, after, updatedAfter, top) {
+    if (after === null) {
+      after = {
+        'id': "null",
+        'key': "null"
+      }
+    }
+
+    var response = this.connection.getSync('/tasks', {
+      'page_size': top.toString(), 
+      'page': this.ytTaskCounter.toString(), 
+      'after_id': after.id, 
+      'after_key': after.key, 
+      'updated_after': updatedAfter
+    });
+    var tasks = JSON.parse(response.response);
+    console.log('loaded ' + tasks.data.length + ' tasks for counter ' + this.ytTaskCounter + ' and page size ' + top);
+
+    this.ytTaskCounter++;
+
+
+    var ytIssues = [];
+    tasks.data.forEach((task) => {
+      var ytIssue = this.convertTaigaTask(task);
+      ytIssues.push(ytIssue);
+    }, this);
+
+    return ytIssues;
+  }
+
+  convertTaigaTask(task) {
+    let attachments =[];
+    if (task.attachments) {
+      attachments = task.attachments.map((attach, idx) => this.getYtAttachmentFromTaigaAttachment(attach, idx, 't.' + task.ref + ".att." + idx), this);
+    }
+    let comments = [];
+    let history = [];
+    if (task.history) {
+      comments = this.getYtCommentsFromTaigaHistory(task.history, task.ref);
+      history = this.getYtHistoryFromTaigaHistory(task.history, task.ref);
+    }
+    let tags = [];
+    if (task.tags) {
+      tags = task.tags.map((tag) => this.getYtTagFromTaigaTag(tag), this);
+    }
+    let taskLinks = [];
+    if (task.user_story) {
+      taskLinks = [{
+          linkName: 'workitem',
+          target: {
+            id: task.user_story + ''
+          },
+          type: 'link'
+      }];
+    }
+
+    return {
+      id: task.ref,
+      key: "TG-" + task.ref,
+      fields: {
+        attachments: attachments,
+        author: this.getYtUserByEmail(task.owner),
+        comments: comments,
+        created: task.created_date,
+        description: this.replaceMediaLinksWithFilename(task.description, task.history),
+        links: taskLinks,
+        project: this.ytProject,
+        references: [],
+        resolved: false,
+        summary: task.subject,
+        tags: tags,
+        updated: task.modified_date,
+        visibleToUsers: this.ytUsers,
+        State: {
+          type: 'enum',
+          value: task.status
+        },
+        Type: {
+          type: 'enum',
+          value: 'Task'
+        },
+      },
+      history: history
+    };
+  }
+}
+
+/**
+ * @classdesc The base class containing information about a project.
+ * @typedef {Object} ProjectInfo The base class containing information about a project.
+ * @property {string} id The ID of the project.
+ * @property {string} key The key of the project.
+ * @property {string} name The name of the project.
+ */
+
+/**
+ * @classdesc Represents a project entity.
+ * @typedef {Object} Project Represents a project entity.
+ * @extends ProjectInfo
+ * @property {string} id The ID of the project.
+ * @property {string} key The key of the project.
+ * @property {string} name The name of the project.
+ * @property {string} description The description of the project.
+ * @property {boolean} archived When `true`, the project is marked as archived. Considered as `false` if the value of this property is not set. If the project already exists in YouTrack, its archived status is not updated.
+ * @property {User} lead The leader of the project.
+ * @property {ProjectField[]} fields The set of custom fields of the project.
+ * @property {User[]} [adminUsers] The set of users who have admin permissions in the project. Empty by default.
+ * @property {UserGroup[]} [adminGroups] The set of groups that have admin permissions in the project. Empty by default.
+ * @property {User[]} [teamUsers] The set of team members of the project. Empty by default.
+ * @property {UserGroup[]} [teamGroups] The set of groups included into the project team. Empty by default.
+ */
+
+/**
+ * @classdesc The base class containing information about a project custom field.
+ * @typedef {Object} ProjectFieldInfo The base class containing information about a project custom field.
+ * @param id The ID of the project custom field.
+ * @param name The name of the project custom field.
+ * @param type The type of the project custom field. `null` by default.
+ * @param multiValue When `true`, the project custom field can support multiple values. A field can be either simple or multi-value. `false` by default.
+
+ */
+
+/**
+ * @classdesc Represents a project custom field entity.
+ * @typedef {Object} ProjectField Represents a project custom field entity.
+ * @extends ProjectFieldInfo
+ * @property {string} id The ID of the project custom field.
+ * @property {string} name The name of the project custom field.
+ * @property {string} type The type of the project custom field.
+ * @property {boolean} multiValue When `true`, the project custom field can support multiple values. A field can be either simple or multi-value. `false` by default.
+ */
+
+/**
+ * @classdesc Represents a set of server properties.
+ * @typedef {Object} ServerInfo Represents a set of server properties.
+ * @property {string} version The version of the import source.
+ * @property {string} time The time zone of the import source.
+ */
+
+/**
+ * @classdesc The base class containing information about an issue or an article.
+ * @typedef {Object} DocumentInfo The base class containing information about an issue or an article.
+ * @property {string} id The ID of the entity.
+ * @property {string} key The key of the entity.
+ */
+
+/**
+ * @classdesc Represents an issue entity.
+ * @typedef {Object} Issue Represents an issue entity.
+ * @extends DocumentInfo
+ * @property {string} id The issue ID.
+ * @property {string} key The issue key.
+ * @property {DocumentFields} fields The field values of the issue.
+ * @property {HistoryItem[]} [history] The history of the issue.
+ */
+
+/**
+ * @classdesc Represents an article entity.
+ * @typedef {Object} Article Represents an article entity.
+ * @extends DocumentInfo
+ * @property {string} id The article ID.
+ * @property {string} key The article key.
+ * @property {DocumentFields} fields The field values of the article.
+ * @property {HistoryItem[]} [history] The article history.
+ */
+
+/**
+ * @classdesc Represents predefined fields of a document that could be either issue or article. Some fields are relevant for both document types, some are relevant only for issues or only for articles.
+ * @typedef {Object} DocumentFields Represents predefined fields of a document that could be either issue or article.
+ * @property {string} created The date and time when the document was created.
+ * @property {User} author The author of the document.
+ * @property {string} summary The summary of the document.
+ * @property {string} [description] The description of the issue. For issues only.
+ * @property {string} [content] The content of the article. For articles only.
+ * @property {User} [updatedBy] The user who last updated the document.
+ * @property {string} [updated] The date and time when the document was last updated.
+ * @property {string} [resolved] The date and time when the issue was resolved. For issues only.
+ * @property {LinkValue[]} [links] The links of the issue. For issues only.
+ * @property {LinkValue} [parent] The parent of the article. For articles only.
+ * @property {Comment[]} [comments] The comments of the document.
+ * @property {Attachment[]} [attachments] The attachments of the document.
+ * @property {WorkItem[]} [workItems] The work items of the issue. For issues only.
+ * @property {Reference[]} [references] The references of the document.
+ * @property {User[]} [visibleToUsers] The users who can view the document.
+ * @property {UserGroup[]} [visibleToGroups] The user groups that can view the document.
+ * @property {User[]} [watchers] The users who are watching the document.
+ * @property {User[]} [voters] The users who voted the issue. For issues only.
+ * @property {Tag[]} [tags] The tags of the document.
+ * @property {ProjectValue} [project] The project where the document belongs.
+ */
+
+/**
+ * @classdesc Represents field values.
+ * @typedef {Object} DocumentFieldValues Represents field values.
+ */
+
+/**
+ * @classdesc Represents a value for a custom field in an issue or an article.
+ * @typedef {Object} DocumentFieldValue Represents a value for a custom field in an issue or an article.
+ * @extends DocumentFieldValues
+ * @property {Object|string|number} values The set of values for a custom field in an issue or an article.
+ */
+
+/**
+ * @classdesc Represents a string presentation for a custom field value in an issue or an article.
+ * @typedef {Object} DocumentFieldValuesStringPresentation a string presentation for a custom field value in an issue or an article.
+ * @extends DocumentFieldValues
+ * @property {string[]} values The set of values for a custom field in an issue or an article.
+ */
+
+/**
+ * @classdesc Represents a presentation of an enum custom field.
+ * @typedef {Object} EnumerableFieldPresentation Represents a presentation of an enum custom field.
+ * @property {string} stringPresentation The string presentation of the enum custom field.
+ * @property {FieldValue} value The value of the enum custom field.
+ */
+
+/**
+ * @classdesc Represents a group project custom field entity.
+ * @typedef {Object} GroupProjectField Represents a group project custom field entity.
+ * @extends ProjectField
+ * @property {string} id The ID of the project custom field.
+ * @property {string} name The name of the project custom field.
+ * @property {boolean} multiValue When `true`, the project custom field can support multiple values. A field can be either simple or multi-value. `false` by default.
+ */
+
+/**
+ * @classdesc The ancestor for custom field value entities.
+ * @typedef {Object} FieldValue The ancestor for custom field value entities.
+ */
+
+/**
+ * @classdesc Represents a user entity.
+ * @typedef {Object} User Represents a user entity.
+ * @property {string} id The ID of the user.
+ * @property {string} name The name of the user.
+ * @property {string} fullName The full name of the user.
+ * @property {string} email The email address of the user.
+ * @property {boolean} banned If the user is currently banned, this property is `true`. The default value is `false`.
+ * @property {boolean} deleted If the user is deleted, this property is `true`. The default value is `false`.
+ */
+
+/**
+ * @classdesc Represents a user group entity.
+ * @typedef {Object} UserGroup Represents a user group entity.
+ * @property {string} id The ID of the user group.
+ * @property {string} name The name of the user group.
+ */
+
+/**
+ * @classdesc Represents an attachment entity.
+ * @typedef {Object} Attachment Represents an attachment entity.
+ * @extends SubItem
+ * @property {string} id The ID of the attachment.
+ * @property {string} fileName The name of the attachment file.
+ * @property {User} author The user who attached the file to the issue.
+ * @property {string} created The date and time when the attachment was created. The expected string format is one of those returned by the `getTimestampFormats` function.
+ * @property {User} updatedBy The user who last updated the file. The same as `author` by default.
+ * @property {string} updated The date and time the attachment was last updated. The same as `created` by default. The expected string format is one of those returned by the `getTimestampFormats` function.
+ * @property {string} mimeType The MIME type of the file.
+ * @property {string} charset The charset type of the file. `null` by default. Applicable to text attachments only.
+ * @property {User[]} visibleToUsers The users who can view the attachment. If none of the `visibleToUsers` and the `visibleToGroups` parameters are specified, the attachment becomes visible to issue or article readers. `null` by default.
+ * @property {UserGroup[]} visibleToGroups  The user groups that can view the attachment. `null` by default.
+ */
+
+/**
+ * @classdesc Represents the content of an attachment with metadata.
+ * @typedef {Object} AttachmentContentWithMetadata Represents the content of an attachment with metadata.
+ * @property {Stream|string} data The attachment content as obtained from `Response.responseAsStream` or as base64-encoded content.
+ * For reference on the Response class, see {@link https://www.jetbrains.com/help/youtrack/devportal/v1-Response.html|Response}.
+ * @property {Object} metadata The attachment metadata.
+ * @property {string} metadata.mimeType The MIME type of the file. `null` by default.
+ * @property {string} metadata.charset The charset type of the file. `null` by default. Applicable to text attachments only.
+ */
+
+/**
+ * @classdesc Represents the metadata of an attachment.
+ * @typedef {Object} AttachmentMetaData Represents the metadata of an attachment.
+ * @property {string} mimeType Mime type of the file. `null` by default.
+ * @property {string} charset The charset type of the file. `null` by default.
+ */
+
+/**
+ * @classdesc Represents an issue link type entity.
+ * @typedef {Object} LinkType Represents an issue link type entity.
+ * @property {string} id The ID of the issue link type.
+ * @property {string} name The name of the issue link type.
+ * @property {string} sourceToTarget The outward name of the issue link type.
+ * @property {string} targetToSource The inward name of the issue link type.
+ */
+
+/**
+ * @classdesc The ancestor for custom field value entities.
+ * @typedef {Object} FieldValue The ancestor for custom field value entities.
+ * @property {'string'|'text'|'integer'|'float'|'date'|'period'|'datetime'|'state'|'ownedField'|'group'|'user'|'enum'|'version'|'build'|'link'|'comment'|'attachment'|'workItem'|'tag'|'reference'|'project'} type The type of the field.
+ */
+
+/**
+ * @classdesc Represents a user entity
+ * @typedef {Object} User Represents a user entity.
+ * @implements FieldValue
+ * @property {'user'} type The type of the custom field.
+ * @property {string} id The ID of the user.
+ * @property {string} name The name of the user.
+ * @property {string} [fullName] The full name of the user.
+ * @property {string} [email] The email address of the user.
+ * @property {boolean} [banned] If the user is currently banned, this property is `true`. The default value is `false`.
+ * @property {boolean} [deleted] If the user is deleted, this property is `true`. The default value is `false`.
+ */
+
+/**
+ * @classdesc Represents a user group entity.
+ * @typedef {Object} UserGroup Represents a user group entity.
+ * @implements FieldValue
+ * @property {'group'} type The type of the custom field.
+ * @property {string} id The ID of the user group.
+ * @property {string} name The name of the user group.
+ */
+
+/**
+ * @classdesc Represents a field change entity.
+ * @typedef {Object} FieldChange Represents a field change entity.
+ * @property {DocumentFieldValues[]} removedValues The set of values removed in the transaction.
+ * @property {DocumentFieldValues[]} addedValues The set of values added in the transaction.
+ */
+
+/**
+ * @classdesc Represents a change in the document history.
+ * @typedef {Object} HistoryItem Represents a change in the document history.
+ * @property {string} id The ID of the change.
+ * @property {User} author The author of the change.
+ * @property {string} timestamp The date and time of the change.
+ * @property {Map<string, FieldChange>} fieldChanges The set of field changes made in the transaction.
+ */
+
+/**
+ * @classdesc Represents a reference entity. Reference is a link from one article to another.
+ * When an article that's being imported contains a link to another article, this link is imported as a temporary string at first.
+ * This approach ensures that links to articles that are not imported yet are not lost.
+ * When import is finished, temporary strings are replaced with ordinary references to existing articles when possible.
+ * @typedef {Object} Reference Represents a reference entity. Reference is a link from one article to another.
+ * @implements FieldValue
+ * @property {'reference'} type The type of the custom field.
+ * @property {string} documentType The type of document in YouTrack where the reference points to. The expected value is `page`.
+ * @property {string} linkedDocumentId The ID of the linked document.
+ * @property {string} refToReplace The temporary reference string. When import is finished, this string will be replaced with a link to a real article.
+ * @property {string} [link] The URL of the linked article. If the linked article is not imported for some reason, this URL will be shown instead of a link.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `enum` type.
+ * @typedef {Object} EnumElement Represents a value of a custom field of `enum` type.
+ * @implements FieldValue
+ * @property {'enum'} type The type of the custom field.
+ * @property {string} name The name of the enum custom field value.
+ * @property {string} [description] The description of the enum custom field value. When not set, acts as `null`.
+ * @property {boolean} [archived] When `true`, the enum custom field value is marked as archived. Considered as `false` if the value of this property is not set. If the `EnumElement` already exists in YouTrack, its archived status is not updated.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `state` type.
+ * @typedef {Object} State Represents a value of a custom field of `state` type.
+ * @extends EnumElement
+ * @implements FieldValue
+ * @property {'state'} type The type of the custom field.
+ * @property {boolean} [archived] When `true`, the state custom field value is marked as archived. Considered as `false` if the value of this property is not set. If the State value already exists in YouTrack, its archived status is not updated.
+ * @property {boolean} [isResolved] When `true`, the state custom field value is marked as resolved. Considered as `false` if the value of this property is not set. If the State value already exists in YouTrack, its resolved status is not updated.
+ * /
+
+ /**
+ * @classdesc Represents a value of a custom field of `build` type.
+ * @typedef {Object} Build Represents a value of a custom field of `build` type.
+ * @extends EnumElement
+ * @implements FieldValue
+ * @property {'build'} type The type of the custom field.
+ * @property {string} [assembleDate] The date and time of the assembly date of the build custom field value. `null` by default. The expected string format is one of those returned by the `getTimestampFormats` function.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `state` type.
+ * @typedef {Object} Version Represents a value of a custom field of `state` type.
+ * @extends EnumElement
+ * @implements FieldValue
+ * @property {'version'} type The type of the custom field.
+ * @property {string} [releaseDate] The date and time of the release date of the version custom field value. `null` by default. The expected string format is one of those returned by the `getTimestampFormats` function.
+ * @property {boolean} [released] When `true`, the version custom field value is marked as released. `null` by default.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `ownedField` type.
+ * @typedef {Object} OwnedValue Represents a value of a custom field of `ownedField` type.
+ * @extends EnumElement
+ * @implements FieldValue
+ * @property {'ownedField'} type The type of the custom field.
+ * @property {User} [owner] The user associated with the owned custom field value. `null` by default.
+ */
+
+/**
+ * @classdesc The base class for authored entities that are associated with an issue.
+ * @typedef {Object} SubItem The base class for authored entities that are associated with an issue.
+ * @implements FieldValue
+ * @property {string} id The ID of the entity.
+ * @property {User} author The author of the entity.
+ * @property {string} created The date and time when the entity was created. The expected string format is one of those returned by the `getTimestampFormats` function.
+ * @property {User} [updatedBy] The user who last updated the entity.
+ * @property {string} [updated] The date and time when the entity was last updated. The expected string format is one of those returned by the `getTimestampFormats` function.
+ */
+
+/**
+ * @classdesc Represents a comment entity.
+ * @typedef {Object} Comment Represents a comment entity.
+ * @extends SubItem
+ * @implements FieldValue
+ * @property {Attachment[]} attachments The files attached to the comment.
+ * @property {'comment'} type The type of the custom field.
+ * @property {User[]} [visibleToUsers] The users who can view the comment. If none of the `visibleToUsers` and the `visibleToGroups` parameters are specified, the comment becomes visible to issue or article readers. `null` by default.
+ * @property {UserGroup[]} [visibleToGroups] The user groups that can view the comment. `null` by default.
+ */
+
+/**
+ * @classdesc Represents an attachment entity.
+ * @typedef {Object} Attachment Represents an attachment entity.
+ * @extends SubItem
+ * @implements FieldValue
+ * @property {'attachment'} type The type of the custom field.
+ * @property {User[]} [visibleToUsers] The users who can view the attachment. If none of the `visibleToUsers` and the `visibleToGroups` parameters are specified, the attachment becomes visible to issue or article readers. `null` by default.
+ * @property {UserGroup[]} [visibleToGroups] The user groups that can view the attachment. `null` by default.
+ * @property {string} [mimeType] The MIME type of the file.
+ * @property {string} [charset] The charset type of the file. Applicable to text attachments only.
+ */
+
+/**
+ * @classdesc Represents a work item entity.
+ * @typedef {Object} WorkItem Represents a work item entity.
+ * @extends SubItem
+ * @implements FieldValue
+ * @property {'workItem'} type The type of the custom field.
+ * @property {string} created The date when the work item was created. The expected string format is one of those returned by the `getTimestampFormats` function.
+ * @property {string} started The date and time when the work started. The same as `created` by default. The expected string format is one of those returned by the `getTimestampFormats` function.
+ * @property {number} duration The duration of the work item in minutes.
+ */
+
+/**
+ * @classdesc Represents an issue tag entity.
+ * @typedef {Object} Tag Represents an issue tag entity.
+ * @implements FieldValue
+ * @property {'tag'} type The type of the custom field.
+ * @property {string} id The ID of the tag.
+ * @property {string} name The name of the tag.
+ * @property {User} owner The user who created the tag.
+ * @property {User[]} [visibleToUsers] The users who can see this tag. If the tag is visible only for its owner, this property is `null`. `null` by default.
+ * @property {UserGroup[]} [visibleToGroups] The user groups that can see this tag. If the tag is visible only for its owner, this property is `null`.
+ * If this property is `null`, the visibility of the tag is automatically limited to the project owner and the project team. `null` by default.
+ * @property {User[]} [editableByUsers] The users who can edit this tag. If the tag is editable only by its owner, this property is `null`. `null` by default.
+ * @property {UserGroup[]} [editableByGroups] The user groups that can edit this tag. If the tag is editable only by its owner, this property is `null`. `null` by default.
+ * @property {User[]} [usableByUsers] The users who can use this tag. If the tag is editable only by its owner, this property is `null`. `null` by default.
+ * @property {UserGroup[]} [usableByGroups] The user groups that can edit this tag. If the tag is editable only by its owner, this property is `null`. `null` by default.
+ */
+
+/**
+ * @classdesc Represents the project that is set in an issue or article that belongs to this project.
+ * @typedef {Object} ProjectValue Represents the project that is set in an issue or article that belongs to this project.
+ * @implements FieldValue
+ * @property {'project'} type The type of the custom field.
+ * @property {string} id The ID of the project.
+ * @property {string} name The name of the project.
+ * @property {string} key The key of the project.
+ * @property {ProjectFieldInfo[]} fields The set of fields of the project.
+ */
+
+/**
+ * @classdesc Represents a link from one issue to another.
+ * When an issue that's being imported contains a link to another issue, this link is imported as a temporary string at first.
+ * This approach ensures that links to issues that are not imported yet are not lost.
+ * When import is finished, temporary strings are replaced with ordinary references to existing issues when possible.
+ * @typedef {Object} LinkValue Represents a link from one issue to another.
+ * @implements FieldValue
+ * @property {'link'} type The type of the custom field.
+ * @property {string} linkName The name of the link.
+ * @property {DocumentInfo} target The target entity that the link points to.
+ * @property {LinkType} [linkType] The type of the link.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `string` type.
+ * @typedef {Object} StringFieldValue Represents a value of a custom field of `string` type.
+ * @implements FieldValue
+ * @property {'string'} type The type of the custom field.
+ * @property {string} value The value of the field.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `text` type.
+ * @typedef {Object} TextFieldValue Represents a value of a custom field of `text` type.
+ * @implements FieldValue
+ * @property {'text'} type The type of the custom field.
+ * @property {string} value The value of the field.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `integer` type.
+ * @typedef {Object} IntegerFieldValue Represents a value of a custom field of `integer` type.
+ * @implements FieldValue
+ * @property {'integer'} type The type of the custom field.
+ * @property {number} value The value of the field.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `float` type.
+ * @typedef {Object} FloatFieldValue Represents a value of a custom field of `float` type.
+ * @implements FieldValue
+ * @property {'float'} type The type of the custom field.
+ * @property {number} value The value of the field.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `date` type.
+ * @typedef {Object} DateFieldValue Represents a value of a custom field of `date` type.
+ * @implements FieldValue
+ * @property {'date'} type The type of the custom field.
+ * @property {string} value The value of the field. The expected string format is one of those returned by the `getTimestampFormats` function.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `date and time` type.
+ * @typedef {Object} DateTimeFieldValue Represents a value of a custom field of `date and time` type.
+ * @implements FieldValue
+ * @property {'dateTime'} type The type of the custom field.
+ * @property {string} value The value of the field. The expected string format is one of those returned by the `getTimestampFormats` function.
+ */
+
+/**
+ * @classdesc Represents a value of a custom field of `period` type.
+ * @typedef {Object} PeriodFieldValue Represents a value of a custom field of `period` type.
+ * @implements FieldValue
+ * @property {'period'} type The type of the custom field.
+ * @property {string|number} value The value of the field. The expected string format is one of those returned by the `getTimestampFormats` function.
+ */
+
+
+// HELPERS
+
+function replaceMarkdownLinksWithPlaceholder(markdownText, path, placeholder) {
+  // Regular expression to match Markdown links with the specific path
+  const regex = new RegExp(`\\[([^\\]]*)\\]\\(([^)]+${path}[^)]*)\\)`, 'g');
+  
+  // Replace matched links with the placeholder
+  return markdownText.replace(regex, placeholder);
+}
+
+// MAIN ENTRY POINT
+exports.Client = context => new TaigaClient(context);
+/* eslint-enable no-unused-vars */

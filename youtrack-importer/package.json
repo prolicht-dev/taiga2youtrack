@@ -1,0 +1,5 @@
+{
+  "devDependencies": {
+    "@jetbrains/youtrack-scripting-api": "^2022.1.46592"
+  }
+}

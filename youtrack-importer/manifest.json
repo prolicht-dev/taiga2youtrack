@@ -1,0 +1,9 @@
+{
+    "name" : "taiga2youtrack",
+    "title" : "Taiga 2 YouTrack Importer",
+    "version" : "0.0.1",
+    "vendor" : {
+      "name" : "Christoph Haas",
+      "email" : "christoph.haas@prolicht.at"
+    }
+  }
