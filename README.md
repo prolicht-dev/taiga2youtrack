@@ -42,16 +42,14 @@ Once the Taiga data is ready, you need to create a YouTrack Import Integration.
 Go to `Settings -> Integrations -> Imports` and create a new `Custom Import`.
 
  - Custom import URL: http://your-public-ip:8888 (the URL you used above to test, but without /status)
- - Username or email: the username of your YouTrack admin user
- - Password or token: the value of the `BASIC_AUTH_USERNAME` and `BASIC_AUTH_PASSWORD` variable from the Python script, concatenated with a colon (e.g. username:password)
-
-![](doc/custom_import_step0.png)
+ - Username or email: `BASIC_AUTH_USERNAME` of python app
+ - Password:  `BASIC_AUTH_PASSWORD` of python app
 
 Next create a new custom `Import script package`. Name it something like **taiga2youtrack** (in the screenshots it might also appear as taiga2youtrack-import).
 
 ![](doc/custom_import_step1.png)
 
-Modify the import script package, replace the contents of the client file with the one from this repository.
+Modify the import script package, replace the contents of the client file with the one from this repository. The project name in this script and key should match your new YouTrack projects settings. Keys must be unique! If TG is in use already, choose another one!
 
 ![](doc/custom_import_step2.png)
 ![](doc/custom_import_step3.png)
@@ -60,7 +58,7 @@ Next, create the project mapping. Either let the importer create a new project, 
 
 ![](doc/custom_import_step4.png)
 
-The initial import will only create the project. Resume the import once to start the real import of issues, epics, userstories and tasks.
+The inital import creates the issues without links. To also import links, press *resume*. If an error appears you can download the log file as zip. For large projects you may need to wait some minutes until the logs are delivered.
 
 ![](doc/custom_import_step5.png)
 
